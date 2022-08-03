@@ -1,7 +1,6 @@
 from scrapfly import ScrapeConfig, ScrapflyClient
 from bs4 import BeautifulSoup
 from datetime import date
-from time import sleep
 import concurrent.futures
 import logging
 import requests
@@ -34,9 +33,14 @@ class ScrapflyBack():
         current_date = date.today()
         self.today = current_date.strftime('%Y-%m-%d')
 
-        # Logging setup validate if the logging is already setup
+        # Logging setup
         logging.basicConfig(
-            filename=f'{self.today}.log', encoding='utf-8', level=logging.INFO)
+            filename=f'{self.today}.log',
+            format='%(asctime)s %(levelname)-8s %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            encoding='utf-8',
+            level=logging.INFO
+        )
 
         # Get the Scrapfly API key and Client
         self.scrapfly_requests = 0
@@ -63,9 +67,12 @@ class ScrapflyBack():
         """
         Get account info from Scrapfly API
         """
-        response = requests.get(f'{ACCOUNT_URL}?key={key}')
-        info = response.json()
-        return info
+        try:
+            response = requests.get(f'{ACCOUNT_URL}?key={key}')
+            info = response.json()
+            return info
+        except Exception as e:
+            logging.error(f'Error: at account_info: {str(e)}')
 
     def get_remaining(self, key):
         """
@@ -80,7 +87,6 @@ class ScrapflyBack():
             return remaining
         except:
             logging.error('Error: could not get remaining requests')
-            return None
 
     def save_json(self, data, key):
         """
@@ -101,26 +107,32 @@ class ScrapflyBack():
         """
         get soup from url scraped from Scrapfly API
         """
-        config = ScrapeConfig(url=url)
-        response = self.scrapfly.scrape(scrape_config=config)
-        html = response.scrape_result['content']
-        soup = BeautifulSoup(html, 'html.parser')
-        self.scrapfly_requests += 1
-        return soup
+        try:
+            config = ScrapeConfig(url=url)
+            response = self.scrapfly.scrape(scrape_config=config)
+            html = response.scrape_result['content']
+            soup = BeautifulSoup(html, 'html.parser')
+            self.scrapfly_requests += 1
+            return soup
+        except Exception as e:
+            logging.error(f'Error: at get_soup: {str(e)}')
 
     def get_category(self, url):
         """
         get category indicators from the url
         """
+        response = {}
+        response['url'] = FIVERR_URL + url
         items = url.split('/')
-        if len(items) < 5:
+        if len(items) > 2:
+            response['category'] = items[2]
+        if len(items) > 3:
+            response['subCategory'] = items[3]
+        if len(items) < 5 and len(items) > 3:
             items.append(items[3])
-        return {
-            'url': FIVERR_URL + url,
-            'category': items[2],
-            'subCategory': items[3],
-            'nestedSubCategory': items[4]
-        }
+        if len(items) > 4:
+            response['nestedSubCategory'] = items[4]
+        return response
 
     def get_categories(self):
         """
@@ -153,12 +165,11 @@ class ScrapflyBack():
         """
         try:
             logging.info(f'url: {url}')
-            sleep(1)
             soup = self.get_soup(url)
             script = soup.select('script#perseus-initial-props')[0].text
             return json.loads(script)
         except Exception as e:
-            logging.error(f'Error: {e}')
+            logging.error(f'Error at get_data {e}')
 
     def get_concurrent_data(self, url_list):
         """
@@ -172,6 +183,8 @@ class ScrapflyBack():
                 url = future_data[future]
                 try:
                     data = future.result()
+                    data['url'] = url
+                    data['date'] = self.today
                     data_collection.append(data)
                 except Exception as exc:
                     logging.error(f'{url} generated an exception: {exc}')
@@ -206,37 +219,26 @@ class ScrapflyBack():
         """
         Get the total number of pages and data from the category with each service
         """
-        # partitions in subcategories
-        categoryName = category.get("category")
-        subCategory = category.get("subCategory")
-        nestedSubCategory = category.get("nestedSubCategory")
-        logging.info(
-            f"""category name: {categoryName}/{subCategory}/{nestedSubCategory}""")
-
-        # get category data
-        source = 'drop_down_filters'
-        url = f'{category.get("url")}?source={source}&ref={FILTER_URL}'
+        # get category first page data
+        url = f'{category.get("url")}?source=drop_down_filters&ref={FILTER_URL}'
         category_data = self.get_data(url)
 
-        # validate category data
+        # validate if there is category data
         if category_data:
-            services = category_data.get('items')
             category_update = {}
             category_update.update(category_data.get('categoryIds'))
             category_update.update(category_data.get('displayData'))
             category_update.update(category_data.get('facets'))
 
-            # save categories files to s3
+            # save category basic info in s3
             categoryIds = category_data.get('categoryIds')
             title = '-'.join(categoryIds.values())
             key = f'fiverr/categories/{title}.json'
             self.save_json(category_update, key)
 
-            # get total pages and offset
+            # get total pages and offset and url pages for pagination
             total, offset = self.get_pagination(category_data)
             total = min(total, max_pages)
-
-            # get url pages for pagination
             url_list = []
             current = 2
             while current <= total:
@@ -244,51 +246,54 @@ class ScrapflyBack():
                     f'{category.get("url")}?source=pagination&ref={FILTER_URL}&page={current}&offset={offset}')
                 current += 1
 
-            # get data from url pages
-            data_collection = self.get_concurrent_data(url_list)
-            for category_data in data_collection:
-                services = services + category_data.get('items')
+            # get url for each service in pages
+            services = category_data.get('items')
+            services_list = [FIVERR_URL +
+                             service.get('gig_url') for service in services]
 
-            # restrict the number of requests and log the number of requests
-            services = services[:max_requests]
-            logging.info(f'total services: {len(services)}')
-
-            # iterate through the services and get url pages for each service
-            url_list = []
-            for service in services:
-                url_list.append(FIVERR_URL + service.get('gig_url'))
-
-            # get data from url pages
-            chunk_list = self.chunks(url_list, 24)
+            # concurrent get data from url list every 3 pages
+            chunk_list = self.chunks(url_list, 3)
             for chunk in chunk_list:
                 data_collection = self.get_concurrent_data(chunk)
-                if data_collection:
-                    category['date'] = self.today
-                    category['status'] = 'success'
+                for category_data in data_collection:
+                    items = category_data.get('items')
+                    services_list = services_list + \
+                        [FIVERR_URL + item.get('gig_url') for item in items]
 
-                    # save services files to s3
-                    collection = []
-                    for i, gig_data in enumerate(data_collection):
-                        # add additional data to the service
-                        gig_data['url'] = url_list[i]
-                        gig_data['rank'] = i + 1
-                        gig_data['date'] = self.today
+            # restrict the number of requests and log the number of requests
+            services_list = services_list[:max_requests]
+            logging.info(f'total services to scrape: {len(services_list)}')
 
-                        # save to s3
-                        title = gig_data.get("general", {}).get("gigId")
-                        key = f'fiverr/accounts/{categoryName}/{subCategory}/{nestedSubCategory}/{title}.json'
+            # get data from url pages
+            has_data = False
+            chunk_list = self.chunks(services_list, 12)
+            for chunk in chunk_list:
+                # colection of data to be saved in s3
+                collection = []
+                data_collection = self.get_concurrent_data(chunk)
+                # save to s3
+                for gig_data in data_collection:
+                    if gig_data:
+                        title = gig_data.get("general", {}).get(
+                            "gigId", "default")
+                        key = f'fiverr/accounts/{category.get("category")}/{category.get("subCategory")}/{category.get("nestedSubCategory")}/{title}.json'
                         collection.append((gig_data, key))
+                        has_data = True
+                if collection:
                     logging.info(f'total services to save: {len(collection)}')
                     self.save_concurrent_json(collection)
+
+            if has_data:
+                category['date'] = self.today
+                category['status'] = 'success'
         else:
             logging.error(f'Error: could not get category data for {url}')
         return category
 
-    def run(self, max_pages=2, max_requests=100, max_categories=None):
+    def run(self, max_pages=10, max_requests=100, max_categories=None):
         """
         Run the script
         """
-        logging.info(f'---------------------[START]---------------------')
         # start timer
         start = time.time()
 
@@ -298,13 +303,13 @@ class ScrapflyBack():
         # Get the categories
         categories = self.get_categories()
         logging.info(f'categories: {len(categories)}')
-        cant = 0
+        scraped_categories = 0
 
         # Get the categories data
         for category in categories:
             try:
                 # validate max_categories constraint
-                if max_categories and max_categories <= cant:
+                if max_categories and max_categories <= scraped_categories:
                     logging.info(
                         f'Info: max categories reached {max_categories}')
                     break
@@ -319,19 +324,22 @@ class ScrapflyBack():
                 # validate if the category is already scraped today
                 category_date = category.get('date')
                 category_status = category.get('status')
-                if category_date != self.today and category_status != 'success':
+
+                # if the category is already scraped today, skip it
+                categoryName = category.get("category")
+                subCategory = category.get("subCategory")
+                nestedSubCategory = category.get("nestedSubCategory")
+                if category_date != self.today or category_status != 'success':
+                    logging.info(
+                        f'category to scrape: {categoryName}/{subCategory}/{nestedSubCategory}')
                     category = self.get_pages(
                         category, max_pages, max_requests)
-                    cant += 1
+                    scraped_categories += 1
                 else:
-                    categoryName = category.get("category")
-                    subCategory = category.get("subCategory")
-                    nestedSubCategory = category.get("nestedSubCategory")
                     logging.info(
-                        f'Info: category {categoryName}/{subCategory}/{nestedSubCategory} already scraped')
+                        f'category: {categoryName}/{subCategory}/{nestedSubCategory} already scraped')
             except Exception as e:
-                logging.error(f'Error: {str(e)}')
-                continue
+                logging.error(f'Error at run {str(e)}')
 
         # save categories files to s3
         key = f'fiverr/categories/categories.json'
@@ -342,23 +350,45 @@ class ScrapflyBack():
         end = time.time()
         time_elapsed = end - start
 
-        # results
+        # logging info
         logging.info(f'requests before: {remaining_before}')
         logging.info(f'requests after: {remaining_after}')
         logging.info(f'requests done: {self.scrapfly_requests}')
+        logging.info(f'requests elapsed: {remaining_before - remaining_after}')
         logging.info(f'elapsed time: {time_elapsed} seg')
-        logging.info(
-            f'average time: {time_elapsed / self.scrapfly_requests} seg')
-        logging.info(f'---------------------[END]---------------------')
+        if self.scrapfly_requests > 0:
+            logging.info(
+                f'average time: {time_elapsed / self.scrapfly_requests} seg')
+
+        return scraped_categories
 
 
 if __name__ == '__main__':
     fiverr = ScrapflyBack()
+    # total categories to scrape
+    total = 30
     # max number of pages to scrape per category
     pages = 2
     # max number of requests to scrape per category
-    max_req = 50 * pages
+    max_req = 48 * pages
     # max number of categories to scrape
-    bucks = 1
+    bucks = 2
+
+    # loging info about the script
+    logging.info(
+        f'\n\n-------------------[START]-------------------\n\n')
+    logging.info(f'total categories to scrape: {total} \n')
+    logging.info(f'max number of pages to scrape per category: {pages}')
+    logging.info(f'max number of requests to scrape per category: {max_req}')
+    logging.info(f'max number of categories to scrape at once: {bucks} \n')
+
     # run the script
-    fiverr.run(max_pages=pages, max_requests=max_req, max_categories=bucks)
+    scraped = fiverr.run(pages, max_req, bucks)
+    # remove the scraped to the total categories
+    total = total - scraped if scraped > 0 else 0
+
+    # loging info about the script
+    logging.info(f'left categories to scrape: {total}')
+    logging.info(
+        f'\n\n--------------------[END]--------------------\n\n')
+
