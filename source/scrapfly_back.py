@@ -356,10 +356,8 @@ if __name__ == '__main__':
     fiverr = ScrapflyBack()
     # max number of pages to scrape per category
     pages = 2
-    pages = 1
     # max number of requests to scrape per category
     max_req = 50 * pages
-    max_req = 10
     # max number of categories to scrape
     bucks = 1
     # run the script
